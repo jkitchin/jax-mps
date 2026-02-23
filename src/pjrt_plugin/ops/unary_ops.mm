@@ -161,7 +161,6 @@ REGISTER_MPS_OP("stablehlo.exponential_minus_one", HandleExpm1);
 //   else:       result = log(u) * x / (u - 1)
 //
 // The ratio x/(u-1) corrects for the rounding error introduced in computing u.
-// See https://github.com/jkitchin/jax-mps/issues/38
 static ProcessResult HandleLogPlusOne(HandlerContext& ctx) {
     MPSGraphTensor* x = GetInputTensor(ctx, 0);
     if (!x)
