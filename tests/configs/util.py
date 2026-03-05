@@ -196,38 +196,50 @@ class OperationTestConfig:
         grad_vals = []
         for returnnum in range(num_return_values or 1):
 
-            def target(*args, **kwargs):
-                result = func(*args, **kwargs)
-                if num_return_values is None:
-                    assert isinstance(result, jnp.ndarray), (
-                        f"Output of '{func}' is not a tensor."
+            def _make_target(projection=None):
+                def target(*args, **kwargs):
+                    result = func(*args, **kwargs)
+                    if num_return_values is None:
+                        assert isinstance(result, jnp.ndarray), (
+                            f"Output of '{func}' is not a tensor."
+                        )
+                    else:
+                        result = result[returnnum]
+
+                    # For complex outputs, apply a projection (real or imag) so we
+                    # test each component of the complex gradient separately.
+                    if projection is not None:
+                        result = projection(result)
+
+                    # Reduce to the mean if the output is not a scalar; we can only
+                    # differentiate scalars.
+                    if result.shape != ():
+                        result = result.mean()
+                    return result
+
+                return target
+
+            # Determine which projections to test: for complex-valued outputs,
+            # test gradients through both real and imaginary parts separately.
+            # Together these verify the full complex Jacobian.
+            result_element = result if num_return_values is None else result[returnnum]
+            is_complex = jnp.issubdtype(result_element.dtype, jnp.complexfloating)  # pyright: ignore[reportAttributeAccessIssue]
+
+            projections = [jnp.real, jnp.imag] if is_complex else [None]
+
+            for projection in projections:
+                target = _make_target(projection)
+                grad_func = self.grad_transform(target, argnums=argnum)
+                lowered = None
+                if jit:
+                    grad_func = jax.jit(grad_func, static_argnums=self.static_argnums)
+                    lowered = grad_func.lower(*args)
+                grad_vals.append(grad_func(*args))
+
+                # Only mark ops as exercised if the operation succeeded on MPS.
+                if lowered and get_device_placement(result) == MPS_DEVICE:
+                    stablehlo_text = str(lowered.compiler_ir(dialect="stablehlo"))
+                    self.EXERCISED_STABLEHLO_OPS.update(
+                        STABLEHLO_OP_RE.findall(stablehlo_text)
                     )
-                else:
-                    result = result[returnnum]
-
-                # Reduce to the magnitude if the function is complex-valued so we
-                # don't have to deal with complex derivatives. This isn't ideal but
-                # pragmatic.
-                if jnp.issubdtype(result.dtype, jnp.complexfloating):
-                    result = jnp.abs(result)
-
-                # Reduce to the mean if the output is not a scalar; we can only
-                # differentiate scalars.
-                if result.shape != ():
-                    result = result.mean()
-                return result
-
-            grad_func = self.grad_transform(target, argnums=argnum)
-            lowered = None
-            if jit:
-                grad_func = jax.jit(grad_func, static_argnums=self.static_argnums)
-                lowered = grad_func.lower(*args)
-            grad_vals.append(grad_func(*args))
-
-            # Only mark ops as exercised if the operation succeeded on MPS.
-            if lowered and get_device_placement(result) == MPS_DEVICE:
-                stablehlo_text = str(lowered.compiler_ir(dialect="stablehlo"))
-                self.EXERCISED_STABLEHLO_OPS.update(
-                    STABLEHLO_OP_RE.findall(stablehlo_text)
-                )
         return tuple(grad_vals)
