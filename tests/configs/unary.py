@@ -98,6 +98,24 @@ def make_unary_op_configs():
                         key, (16,), complex
                     ),
                 ),
+                OperationTestConfig(
+                    jnp.sinh,
+                    lambda key, complex=complex: complex_standard_normal(
+                        key, (16,), complex
+                    ),
+                ),
+                OperationTestConfig(
+                    jnp.cosh,
+                    lambda key, complex=complex: complex_standard_normal(
+                        key, (16,), complex
+                    ),
+                ),
+                OperationTestConfig(
+                    jnp.arcsinh,
+                    lambda key, complex=complex: complex_standard_normal(
+                        key, (16,), complex
+                    ),
+                ),
             ]
     yield from [
         OperationTestConfig(jnp.ceil, lambda key: random.normal(key, (16,))),
@@ -121,24 +139,32 @@ def make_unary_op_configs():
             lambda key: random.uniform(key, (16,), minval=-0.9, maxval=0.9),
         ),
         OperationTestConfig(
-            jnp.sinh,
-            lambda key: random.normal(key, (16,)),
+            jnp.arcsin,
+            lambda key: complex_standard_normal(key, (16,), complex=True),
+            name="arcsin-complex",
         ),
         OperationTestConfig(
-            jnp.cosh,
-            lambda key: random.normal(key, (16,)),
-        ),
-        OperationTestConfig(
-            jnp.arcsinh,
-            lambda key: random.normal(key, (16,)),
+            jnp.arccos,
+            lambda key: complex_standard_normal(key, (16,), complex=True),
+            name="arccos-complex",
         ),
         OperationTestConfig(
             jnp.arccosh,
             lambda key: 1 + random.gamma(key, 5.0, (16,)),
         ),
         OperationTestConfig(
+            jnp.arccosh,
+            lambda key: complex_standard_normal(key, (16,), complex=True),
+            name="arccosh-complex",
+        ),
+        OperationTestConfig(
             jnp.arctanh,
             lambda key: random.uniform(key, (16,), minval=-0.9, maxval=0.9),
+        ),
+        OperationTestConfig(
+            jnp.arctanh,
+            lambda key: complex_standard_normal(key, (16,), complex=True),
+            name="arctanh-complex",
         ),
         OperationTestConfig(
             jnp.cbrt,
