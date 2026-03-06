@@ -330,40 +330,22 @@ def make_linalg_op_configs():
             )
 
         # --- Determinant ---
-        # JAX uses direct formulas for 2x2 and 3x3, LU decomposition for 4x4+.
-        # LU decomposition hits a scatter bug on MPS, so 4x4 and 1x1 are xfailed.
-        for n in [2, 3]:
+        for n in [2, 3, 4]:
             yield OperationTestConfig(
                 jnp.linalg.det,
                 lambda key, n=n: random.normal(key, (n, n))
                 + n * jnp.eye(n, dtype=jnp.float32),
                 name=f"det_{n}x{n}",
             )
-        yield pytest.param(
-            OperationTestConfig(
-                jnp.linalg.det,
-                lambda key: random.normal(key, (4, 4))
-                + 4 * jnp.eye(4, dtype=jnp.float32),
-                name="det_4x4",
-            ),
-            marks=[xfail_match("scatter")],
-        )
 
-        # Complex determinant
+        # Complex determinant — only 2x2/3x3 use direct formulas; 4x4+ uses LU
+        # which involves graph-mode gather/scatter on complex tensors (unsupported by MPS).
         for n in [2, 3]:
             yield OperationTestConfig(
                 jnp.linalg.det,
                 lambda key, n=n: _random_complex_posdef(key, n),
                 name=f"det_complex_{n}x{n}",
             )
-        yield pytest.param(
-            OperationTestConfig(
-                jnp.linalg.det,
-                lambda key: _random_complex_posdef(key, 4),
-                name="det_complex_4x4",
-            ),
-            marks=[xfail_match("scatter")],
-        )
 
         # Complex with purely real data
         yield OperationTestConfig(
@@ -374,22 +356,11 @@ def make_linalg_op_configs():
             name="det_complex_real_only",
         )
 
-        # 1x1 determinant — uses LU path, hits scatter bug
-        yield pytest.param(
-            OperationTestConfig(
-                jnp.linalg.det,
-                numpy.array([[5.0]], dtype=numpy.float32),
-                name="det_1x1",
-            ),
-            marks=[xfail_match("scatter")],
-        )
-        yield pytest.param(
-            OperationTestConfig(
-                jnp.linalg.det,
-                numpy.array([[3.0 + 4.0j]], dtype=numpy.complex64),
-                name="det_complex_1x1",
-            ),
-            marks=[xfail_match("scatter")],
+        # 1x1 determinant
+        yield OperationTestConfig(
+            jnp.linalg.det,
+            numpy.array([[5.0]], dtype=numpy.float32),
+            name="det_1x1",
         )
 
         # Batched determinant

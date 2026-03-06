@@ -646,6 +646,25 @@ static ProcessResult HandleScatter(HandlerContext& ctx) {
     NSArray<NSNumber*>* indicesShape = scatterIndices.shape;
     NSUInteger indicesRank = indicesShape.count;
 
+    // Normalize scalar indices: when index_vector_dim == rank(indices), each index
+    // element is a scalar. Reshape indices to append a trailing size-1 dimension
+    // so that downstream patterns (which expect index_vector_dim == rank - 1) match.
+    if (indexVectorDim == (int64_t)indicesRank) {
+        NSMutableArray<NSNumber*>* newShape = [NSMutableArray arrayWithArray:indicesShape];
+        [newShape addObject:@1];
+        scatterIndices = [ctx.graph reshapeTensor:scatterIndices withShape:newShape name:nil];
+        indicesShape = scatterIndices.shape;
+        indicesRank = indicesShape.count;
+        // indexVectorDim now points to the new last dimension
+    }
+
+    // Handle full-operand replacement: when scatter_dims_to_operand_dims is empty (K=0),
+    // the update window covers all operand dimensions and the result is simply the updates.
+    // This pattern appears in JAX's inlined LU decomposition on MPS.
+    if (scatterDimsToOperandDims.empty()) {
+        return Result(ctx, updates, "scatter");
+    }
+
     // Handle batched scatter pattern used by sort gradients:
     // Pattern: scatter with batching dimensions where each batch element scatters independently
     // Example: input [5,7], indices [5,7,1], updates [5,7]
