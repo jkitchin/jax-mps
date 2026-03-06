@@ -329,6 +329,86 @@ def make_linalg_op_configs():
                 name=f"triangular_solve_batched_{batch_str}",
             )
 
+        # --- Determinant ---
+        # JAX uses direct formulas for 2x2 and 3x3, LU decomposition for 4x4+.
+        # LU decomposition hits a scatter bug on MPS, so 4x4 and 1x1 are xfailed.
+        for n in [2, 3]:
+            yield OperationTestConfig(
+                jnp.linalg.det,
+                lambda key, n=n: random.normal(key, (n, n))
+                + n * jnp.eye(n, dtype=jnp.float32),
+                name=f"det_{n}x{n}",
+            )
+        yield pytest.param(
+            OperationTestConfig(
+                jnp.linalg.det,
+                lambda key: random.normal(key, (4, 4))
+                + 4 * jnp.eye(4, dtype=jnp.float32),
+                name="det_4x4",
+            ),
+            marks=[xfail_match("scatter")],
+        )
+
+        # Complex determinant
+        for n in [2, 3]:
+            yield OperationTestConfig(
+                jnp.linalg.det,
+                lambda key, n=n: _random_complex_posdef(key, n),
+                name=f"det_complex_{n}x{n}",
+            )
+        yield pytest.param(
+            OperationTestConfig(
+                jnp.linalg.det,
+                lambda key: _random_complex_posdef(key, 4),
+                name="det_complex_4x4",
+            ),
+            marks=[xfail_match("scatter")],
+        )
+
+        # Complex with purely real data
+        yield OperationTestConfig(
+            jnp.linalg.det,
+            lambda key: (
+                random.normal(key, (3, 3)) + 3 * jnp.eye(3, dtype=jnp.float32)
+            ).astype(jnp.complex64),
+            name="det_complex_real_only",
+        )
+
+        # 1x1 determinant — uses LU path, hits scatter bug
+        yield pytest.param(
+            OperationTestConfig(
+                jnp.linalg.det,
+                numpy.array([[5.0]], dtype=numpy.float32),
+                name="det_1x1",
+            ),
+            marks=[xfail_match("scatter")],
+        )
+        yield pytest.param(
+            OperationTestConfig(
+                jnp.linalg.det,
+                numpy.array([[3.0 + 4.0j]], dtype=numpy.complex64),
+                name="det_complex_1x1",
+            ),
+            marks=[xfail_match("scatter")],
+        )
+
+        # Batched determinant
+        for batch_shape in [(2,), (2, 3)]:
+            batch_str = "x".join(map(str, batch_shape))
+            yield OperationTestConfig(
+                jnp.linalg.det,
+                lambda key, bs=batch_shape: random.normal(key, (*bs, 3, 3))
+                + 3 * jnp.eye(3, dtype=jnp.float32),
+                name=f"det_batched_{batch_str}",
+            )
+            yield OperationTestConfig(
+                jnp.linalg.det,
+                lambda key, bs=batch_shape: _random_complex_posdef(
+                    key, 3, batch_shape=bs
+                ),
+                name=f"det_complex_batched_{batch_str}",
+            )
+
         # Edge case: zero batch size (empty batch dimension)
         # CPU handles this correctly, returning empty arrays with the right shape.
         # MPS doesn't support zero-sized tensors.
