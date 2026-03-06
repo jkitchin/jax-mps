@@ -4,7 +4,7 @@ from jax import numpy as jnp
 from jax import random
 from jax.scipy.linalg import solve_triangular
 
-from .util import OperationTestConfig, xfail_match
+from .util import OperationTestConfig, complex_standard_normal, xfail_match
 
 
 def _random_posdef(key, n: int, batch_shape: tuple[int, ...] = ()):
@@ -63,6 +63,40 @@ def _random_triangular_unit_diag(key, n: int):
     # Use eye mask to set diagonal to 1 without advanced indexing
     eye = jnp.eye(n, dtype=jnp.float32)
     return L * (1 - eye) + eye
+
+
+def _random_complex_triangular(
+    key,
+    n: int,
+    lower: bool = True,
+    batch_shape: tuple[int, ...] = (),
+):
+    """Generate random well-conditioned complex triangular matrices."""
+    shape = (*batch_shape, n, n)
+    k1, k2 = random.split(key)
+    M = random.normal(k1, shape) + 1j * random.normal(k2, shape)
+    L = jnp.tril(M) if lower else jnp.triu(M)
+    eye = jnp.eye(n, dtype=jnp.complex64)
+    off_diag = L * (1 - eye)
+    diag_values = jnp.abs(L * eye) + eye
+    return off_diag + diag_values
+
+
+def _random_complex_triangular_unit_diag(key, n: int):
+    """Generate random complex unit-diagonal triangular matrix."""
+    k1, k2 = random.split(key)
+    M = random.normal(k1, (n, n)) + 1j * random.normal(k2, (n, n))
+    L = jnp.tril(M)
+    eye = jnp.eye(n, dtype=jnp.complex64)
+    return L * (1 - eye) + eye
+
+
+def _solve_triangular_lower_adjoint(L, B):
+    return solve_triangular(L, B, lower=True, trans=2)
+
+
+def _solve_triangular_upper_adjoint(U, B):
+    return solve_triangular(U, B, lower=False, trans=2)
 
 
 def make_linalg_op_configs():
@@ -131,6 +165,85 @@ def make_linalg_op_configs():
             lambda key: _random_triangular_unit_diag(key, 3),
             lambda key: random.normal(key, (3, 1)),
             name="triangular_solve_unit_diagonal",
+        )
+
+        # --- Complex triangular solve ---
+        for n in [2, 3, 4]:
+            yield OperationTestConfig(
+                _solve_triangular_lower,
+                lambda key, n=n: _random_complex_triangular(key, n, lower=True),
+                lambda key, n=n: complex_standard_normal(key, (n, 1), complex=True),
+                name=f"triangular_solve_complex_lower_{n}x{n}",
+            )
+            yield OperationTestConfig(
+                _solve_triangular_upper,
+                lambda key, n=n: _random_complex_triangular(key, n, lower=False),
+                lambda key, n=n: complex_standard_normal(key, (n, 1), complex=True),
+                name=f"triangular_solve_complex_upper_{n}x{n}",
+            )
+            yield OperationTestConfig(
+                _solve_triangular_lower,
+                lambda key, n=n: _random_complex_triangular(key, n, lower=True),
+                lambda key, n=n: complex_standard_normal(key, (n, 3), complex=True),
+                name=f"triangular_solve_complex_lower_{n}x{n}_multi_rhs",
+            )
+
+        # Complex transpose and adjoint (conjugate transpose)
+        yield OperationTestConfig(
+            _solve_triangular_lower_trans,
+            lambda key: _random_complex_triangular(key, 3, lower=True),
+            lambda key: complex_standard_normal(key, (3, 1), complex=True),
+            name="triangular_solve_complex_lower_trans",
+        )
+        yield OperationTestConfig(
+            _solve_triangular_lower_adjoint,
+            lambda key: _random_complex_triangular(key, 3, lower=True),
+            lambda key: complex_standard_normal(key, (3, 1), complex=True),
+            name="triangular_solve_complex_lower_adjoint",
+        )
+        yield OperationTestConfig(
+            _solve_triangular_upper_adjoint,
+            lambda key: _random_complex_triangular(key, 3, lower=False),
+            lambda key: complex_standard_normal(key, (3, 1), complex=True),
+            name="triangular_solve_complex_upper_adjoint",
+        )
+
+        # Complex unit diagonal
+        yield OperationTestConfig(
+            _solve_triangular_unit_diag,
+            lambda key: _random_complex_triangular_unit_diag(key, 3),
+            lambda key: complex_standard_normal(key, (3, 1), complex=True),
+            name="triangular_solve_complex_unit_diagonal",
+        )
+
+        # Complex batched
+        for batch_shape in [(2,), (2, 3)]:
+            batch_str = "x".join(map(str, batch_shape))
+            yield OperationTestConfig(
+                _solve_triangular_lower,
+                lambda key, bs=batch_shape: _random_complex_triangular(
+                    key, 3, lower=True, batch_shape=bs
+                ),
+                lambda key, bs=batch_shape: complex_standard_normal(
+                    key, (*bs, 3, 1), complex=True
+                ),
+                name=f"triangular_solve_complex_batched_{batch_str}",
+            )
+
+        # Complex with purely real data (0 imaginary) — should match float32 results
+        yield OperationTestConfig(
+            _solve_triangular_lower,
+            lambda key: _random_triangular(key, 3, lower=True).astype(jnp.complex64),
+            lambda key: random.normal(key, (3, 1)).astype(jnp.complex64),
+            name="triangular_solve_complex_real_only",
+        )
+
+        # Complex 1x1
+        yield OperationTestConfig(
+            _solve_triangular_lower,
+            numpy.array([[2.0 + 1.0j]], dtype=numpy.complex64),
+            numpy.array([[6.0 + 3.0j]], dtype=numpy.complex64),
+            name="triangular_solve_complex_1x1",
         )
 
         # 1x1 matrices (trivial edge case)
