@@ -75,6 +75,102 @@ static void FillBufferWithZeros(id<MTLCommandBuffer> cmdBuf, id<MTLBuffer> buffe
     [blit endEncoding];
 }
 
+// Metal compute shader for complex Cholesky decomposition.
+// Single-threaded: the algorithm is inherently sequential (column-by-column).
+// Uses float2 to represent complex numbers (real, imag).
+static id<MTLComputePipelineState> GetComplexCholeskyPipeline(id<MTLDevice> device) {
+    static id<MTLComputePipelineState> pipeline = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+      NSString* source =
+          @"#include <metal_stdlib>\n"
+           "using namespace metal;\n"
+           "\n"
+           "// Complex multiply: (a.x+a.y*i)(b.x+b.y*i)\n"
+           "static inline float2 cmul(float2 a, float2 b) {\n"
+           "    return float2(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);\n"
+           "}\n"
+           "\n"
+           "kernel void complex_cholesky(\n"
+           "    device const float2 *A [[buffer(0)]],\n"
+           "    device float2 *L [[buffer(1)]],\n"
+           "    constant uint &n [[buffer(2)]],\n"
+           "    constant uint &is_lower [[buffer(3)]],\n"
+           "    uint tid [[thread_position_in_grid]]\n"
+           ") {\n"
+           "    if (tid != 0) return;\n"
+           "\n"
+           "    // Zero out L\n"
+           "    for (uint i = 0; i < n * n; i++) L[i] = float2(0, 0);\n"
+           "\n"
+           "    if (is_lower) {\n"
+           "        // Lower Cholesky: A = L * L^H\n"
+           "        for (uint j = 0; j < n; j++) {\n"
+           "            // Diagonal: L[j,j] = sqrt(A[j,j].real - sum(|L[j,k]|^2))\n"
+           "            float s = A[j * n + j].x;\n"
+           "            for (uint k = 0; k < j; k++) {\n"
+           "                float2 ljk = L[j * n + k];\n"
+           "                s -= ljk.x * ljk.x + ljk.y * ljk.y;\n"
+           "            }\n"
+           "            if (s <= 0.0f) {\n"
+           "                for (uint i = 0; i < n * n; i++) L[i] = float2(NAN, NAN);\n"
+           "                return;\n"
+           "            }\n"
+           "            float ljj = sqrt(s);\n"
+           "            L[j * n + j] = float2(ljj, 0.0f);\n"
+           "\n"
+           "            // Below diagonal: L[i,j] = (A[i,j] - sum(L[i,k]*conj(L[j,k]))) / L[j,j]\n"
+           "            for (uint i = j + 1; i < n; i++) {\n"
+           "                float2 sum = A[i * n + j];\n"
+           "                for (uint k = 0; k < j; k++) {\n"
+           "                    float2 lik = L[i * n + k];\n"
+           "                    float2 ljk_conj = float2(L[j * n + k].x, -L[j * n + k].y);\n"
+           "                    sum -= cmul(lik, ljk_conj);\n"
+           "                }\n"
+           "                L[i * n + j] = float2(sum.x / ljj, sum.y / ljj);\n"
+           "            }\n"
+           "        }\n"
+           "    } else {\n"
+           "        // Upper Cholesky: A = U^H * U\n"
+           "        for (uint j = 0; j < n; j++) {\n"
+           "            float s = A[j * n + j].x;\n"
+           "            for (uint k = 0; k < j; k++) {\n"
+           "                float2 ukj = L[k * n + j];\n"
+           "                s -= ukj.x * ukj.x + ukj.y * ukj.y;\n"
+           "            }\n"
+           "            if (s <= 0.0f) {\n"
+           "                for (uint i = 0; i < n * n; i++) L[i] = float2(NAN, NAN);\n"
+           "                return;\n"
+           "            }\n"
+           "            float ujj = sqrt(s);\n"
+           "            L[j * n + j] = float2(ujj, 0.0f);\n"
+           "\n"
+           "            for (uint i = j + 1; i < n; i++) {\n"
+           "                float2 sum = A[j * n + i];\n"
+           "                for (uint k = 0; k < j; k++) {\n"
+           "                    float2 ukj_conj = float2(L[k * n + j].x, -L[k * n + j].y);\n"
+           "                    float2 uki = L[k * n + i];\n"
+           "                    sum -= cmul(ukj_conj, uki);\n"
+           "                }\n"
+           "                L[j * n + i] = float2(sum.x / ujj, sum.y / ujj);\n"
+           "            }\n"
+           "        }\n"
+           "    }\n"
+           "}\n";
+      NSError* error = nil;
+      id<MTLLibrary> lib = [device newLibraryWithSource:source options:nil error:&error];
+      if (lib) {
+          id<MTLFunction> func = [lib newFunctionWithName:@"complex_cholesky"];
+          pipeline = [device newComputePipelineStateWithFunction:func error:&error];
+      }
+      if (!pipeline) {
+          MPS_LOG_ERROR("complex_cholesky: failed to compile shader: %s\n",
+                        error.localizedDescription.UTF8String);
+      }
+    });
+    return pipeline;
+}
+
 static NativeResult NativeHandle_cholesky(id<MTLDevice> device, id<MTLCommandBuffer> cmdBuf,
                                           mlir::Operation* op,
                                           const std::vector<id<MTLBuffer>>& inputs) {
@@ -107,151 +203,184 @@ static NativeResult NativeHandle_cholesky(id<MTLDevice> device, id<MTLCommandBuf
         batchSize *= shape[i];
     }
 
-    if (!resultType.getElementType().isF32()) {
-        return NativeResult::Error("cholesky: only float32 is supported");
+    // Detect complex element type.
+    mlir::Type elemType = resultType.getElementType();
+    bool isComplex = mlir::isa<mlir::ComplexType>(elemType);
+
+    if (!isComplex && !elemType.isF32()) {
+        return NativeResult::Error("cholesky: only float32 and complex64 are supported");
     }
 
-    MPSDataType mps_dtype = MlirTypeToMps(resultType.getElementType());
-    int pjrt_dtype = MlirTypeToPjrtDtype(resultType.getElementType());
+    int pjrt_dtype = MlirTypeToPjrtDtype(elemType);
     size_t elem_size = DtypeByteSize(pjrt_dtype);
-    NSUInteger dataRowBytes = (NSUInteger)(n * (int64_t)elem_size);
-    NSUInteger mpsRowBytes = [MPSMatrixDescriptor rowBytesFromColumns:(NSUInteger)n
-                                                             dataType:mps_dtype];
-    size_t matrixDataSize = (size_t)(n * n) * elem_size;  // Size of one matrix in input.
-    size_t matrixMpsSize = (size_t)n * mpsRowBytes;       // Size of one matrix with MPS alignment.
+    size_t matrixDataSize = (size_t)(n * n) * elem_size;
 
     // Allocate output buffer for all batches.
     size_t totalOutSize = (size_t)batchSize * matrixDataSize;
     id<MTLBuffer> outBuf = [device newBufferWithLength:totalOutSize
                                                options:MTLResourceStorageModeShared];
 
-    // Compile the verification shader once.
-    static id<MTLComputePipelineState> verifyPipeline = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-      NSString* source = @"#include <metal_stdlib>\n"
-                          "using namespace metal;\n"
-                          "kernel void cholesky_verify(\n"
-                          "    device float *L [[buffer(0)]],\n"
-                          "    constant uint &n [[buffer(1)]],\n"
-                          "    constant uint &stride [[buffer(2)]],\n"
-                          "    uint tid [[thread_position_in_grid]]\n"
-                          ") {\n"
-                          "    if (tid != 0) return;\n"
-                          "    for (uint j = 0; j < n; j++) {\n"
-                          "        if (L[j * stride + j] <= 0.0f) {\n"
-                          "            for (uint r = 0; r < n; r++)\n"
-                          "                for (uint c = 0; c < n; c++)\n"
-                          "                    L[r * stride + c] = NAN;\n"
-                          "            return;\n"
-                          "        }\n"
-                          "    }\n"
-                          "}\n";
-      NSError* error = nil;
-      id<MTLLibrary> lib = [device newLibraryWithSource:source options:nil error:&error];
-      if (lib) {
-          id<MTLFunction> func = [lib newFunctionWithName:@"cholesky_verify"];
-          verifyPipeline = [device newComputePipelineStateWithFunction:func error:&error];
-      }
-      if (!verifyPipeline) {
-          MPS_LOG_ERROR("cholesky: failed to compile verify shader: %s\n",
-                        error.localizedDescription.UTF8String);
-      }
-    });
-
-    MPSMatrixDescriptor* desc = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)n
-                                                                      columns:(NSUInteger)n
-                                                                     rowBytes:mpsRowBytes
-                                                                     dataType:mps_dtype];
-
-    MPSMatrixDecompositionCholesky* cholesky =
-        [[MPSMatrixDecompositionCholesky alloc] initWithDevice:device
-                                                         lower:lower
-                                                         order:(NSUInteger)n];
-
-    // Pre-allocate reusable buffers for batch processing.
-    // srcSlice: holds one matrix slice copied from input
-    // srcBuf: padded source for MPS (same as srcSlice if no padding needed)
-    // resultBuf: MPS output with alignment
-    // unpaddedBuf: contiguous result (same as resultBuf if no padding needed)
-    //
-    // NOTE: Using MTLResourceStorageModeShared for simplicity. If profiling shows
-    // memory bandwidth is a bottleneck, consider MTLResourceStorageModePrivate for
-    // GPU-only intermediate buffers (srcBuf, resultBuf when padding is needed).
-    bool needsPadding = (mpsRowBytes != dataRowBytes);
-    id<MTLBuffer> srcSlice = [device newBufferWithLength:matrixDataSize
-                                                 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> srcBuf = needsPadding ? [device newBufferWithLength:matrixMpsSize
-                                                              options:MTLResourceStorageModeShared]
-                                        : srcSlice;
-    id<MTLBuffer> resultBuf = [device newBufferWithLength:matrixMpsSize
-                                                  options:MTLResourceStorageModeShared];
-    id<MTLBuffer> unpaddedBuf = needsPadding
-                                    ? [device newBufferWithLength:matrixDataSize
-                                                          options:MTLResourceStorageModeShared]
-                                    : resultBuf;
-
-    MPSMatrix* sourceMatrix = [[MPSMatrix alloc] initWithBuffer:srcBuf descriptor:desc];
-    MPSMatrix* resultMatrix = [[MPSMatrix alloc] initWithBuffer:resultBuf descriptor:desc];
-
-    // Verification kernel constants.
-    uint32_t n32 = (uint32_t)n;
-    uint32_t lStride = (uint32_t)(mpsRowBytes / elem_size);
-
-    // Process each matrix in the batch.
-    for (int64_t b = 0; b < batchSize; b++) {
-        // Blit this matrix slice from input buffer.
-        size_t srcOffset = (size_t)b * matrixDataSize;
-        id<MTLBlitCommandEncoder> blitIn = [cmdBuf blitCommandEncoder];
-        [blitIn copyFromBuffer:inputs[0]
-                  sourceOffset:srcOffset
-                      toBuffer:srcSlice
-             destinationOffset:0
-                          size:matrixDataSize];
-        [blitIn endEncoding];
-
-        // Pad source rows to MPS-recommended alignment if needed.
-        if (needsPadding) {
-            memset(srcBuf.contents, 0, matrixMpsSize);
-            PadToBuffer(cmdBuf, srcSlice, srcBuf, n, dataRowBytes, mpsRowBytes);
+    if (isComplex) {
+        // --- Complex path: Metal compute shader ---
+        id<MTLComputePipelineState> pipeline = GetComplexCholeskyPipeline(device);
+        if (!pipeline) {
+            return NativeResult::Error("cholesky: complex shader compilation failed");
         }
 
-        // Zero-fill result buffer (unused triangle must be clean).
-        FillBufferWithZeros(cmdBuf, resultBuf, matrixMpsSize);
+        uint32_t n32 = (uint32_t)n;
+        uint32_t isLower = lower ? 1U : 0U;
 
-        // The status buffer is unreliable on Apple Silicon — it always writes 0
-        // (success) regardless of whether the input is positive definite.
-        // See https://developer.apple.com/forums/thread/736787
-        [cholesky encodeToCommandBuffer:cmdBuf
-                           sourceMatrix:sourceMatrix
-                           resultMatrix:resultMatrix
-                                 status:nil];
+        id<MTLBuffer> aSlice = [device newBufferWithLength:matrixDataSize
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lSlice = [device newBufferWithLength:matrixDataSize
+                                                   options:MTLResourceStorageModeShared];
 
-        // Verification kernel to check diagonal and fill with NaN if non-positive.
-        if (verifyPipeline) {
+        for (int64_t b = 0; b < batchSize; b++) {
+            size_t offset = (size_t)b * matrixDataSize;
+
+            id<MTLBlitCommandEncoder> blitIn = [cmdBuf blitCommandEncoder];
+            [blitIn copyFromBuffer:inputs[0]
+                      sourceOffset:offset
+                          toBuffer:aSlice
+                 destinationOffset:0
+                              size:matrixDataSize];
+            [blitIn endEncoding];
+
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-            [enc setComputePipelineState:verifyPipeline];
-            [enc setBuffer:resultBuf offset:0 atIndex:0];
-            [enc setBytes:&n32 length:sizeof(n32) atIndex:1];
-            [enc setBytes:&lStride length:sizeof(lStride) atIndex:2];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:aSlice offset:0 atIndex:0];
+            [enc setBuffer:lSlice offset:0 atIndex:1];
+            [enc setBytes:&n32 length:sizeof(n32) atIndex:2];
+            [enc setBytes:&isLower length:sizeof(isLower) atIndex:3];
             [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
             [enc endEncoding];
-        }
 
-        // Unpad result to contiguous layout if needed.
-        if (needsPadding) {
-            UnpadToBuffer(cmdBuf, resultBuf, unpaddedBuf, n, dataRowBytes, mpsRowBytes);
+            id<MTLBlitCommandEncoder> blitOut = [cmdBuf blitCommandEncoder];
+            [blitOut copyFromBuffer:lSlice
+                       sourceOffset:0
+                           toBuffer:outBuf
+                  destinationOffset:offset
+                               size:matrixDataSize];
+            [blitOut endEncoding];
         }
+    } else {
+        // --- Real float32 path: MPSMatrixDecompositionCholesky ---
+        MPSDataType mps_dtype = MlirTypeToMps(elemType);
+        NSUInteger dataRowBytes = (NSUInteger)(n * (int64_t)elem_size);
+        NSUInteger mpsRowBytes = [MPSMatrixDescriptor rowBytesFromColumns:(NSUInteger)n
+                                                                 dataType:mps_dtype];
+        size_t matrixMpsSize = (size_t)n * mpsRowBytes;
 
-        // Blit the result to the output buffer at the correct offset.
-        size_t dstOffset = (size_t)b * matrixDataSize;
-        id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-        [blit copyFromBuffer:unpaddedBuf
-                 sourceOffset:0
-                     toBuffer:outBuf
-            destinationOffset:dstOffset
-                         size:matrixDataSize];
-        [blit endEncoding];
+        // Compile the verification shader once.
+        static id<MTLComputePipelineState> verifyPipeline = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+          NSString* source = @"#include <metal_stdlib>\n"
+                              "using namespace metal;\n"
+                              "kernel void cholesky_verify(\n"
+                              "    device float *L [[buffer(0)]],\n"
+                              "    constant uint &n [[buffer(1)]],\n"
+                              "    constant uint &stride [[buffer(2)]],\n"
+                              "    uint tid [[thread_position_in_grid]]\n"
+                              ") {\n"
+                              "    if (tid != 0) return;\n"
+                              "    for (uint j = 0; j < n; j++) {\n"
+                              "        if (L[j * stride + j] <= 0.0f) {\n"
+                              "            for (uint r = 0; r < n; r++)\n"
+                              "                for (uint c = 0; c < n; c++)\n"
+                              "                    L[r * stride + c] = NAN;\n"
+                              "            return;\n"
+                              "        }\n"
+                              "    }\n"
+                              "}\n";
+          NSError* error = nil;
+          id<MTLLibrary> lib = [device newLibraryWithSource:source options:nil error:&error];
+          if (lib) {
+              id<MTLFunction> func = [lib newFunctionWithName:@"cholesky_verify"];
+              verifyPipeline = [device newComputePipelineStateWithFunction:func error:&error];
+          }
+          if (!verifyPipeline) {
+              MPS_LOG_ERROR("cholesky: failed to compile verify shader: %s\n",
+                            error.localizedDescription.UTF8String);
+          }
+        });
+
+        MPSMatrixDescriptor* desc = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)n
+                                                                          columns:(NSUInteger)n
+                                                                         rowBytes:mpsRowBytes
+                                                                         dataType:mps_dtype];
+
+        MPSMatrixDecompositionCholesky* cholesky =
+            [[MPSMatrixDecompositionCholesky alloc] initWithDevice:device
+                                                             lower:lower
+                                                             order:(NSUInteger)n];
+
+        bool needsPadding = (mpsRowBytes != dataRowBytes);
+        id<MTLBuffer> srcSlice = [device newBufferWithLength:matrixDataSize
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> srcBuf = needsPadding
+                                   ? [device newBufferWithLength:matrixMpsSize
+                                                         options:MTLResourceStorageModeShared]
+                                   : srcSlice;
+        id<MTLBuffer> resultBuf = [device newBufferWithLength:matrixMpsSize
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> unpaddedBuf = needsPadding
+                                        ? [device newBufferWithLength:matrixDataSize
+                                                              options:MTLResourceStorageModeShared]
+                                        : resultBuf;
+
+        MPSMatrix* sourceMatrix = [[MPSMatrix alloc] initWithBuffer:srcBuf descriptor:desc];
+        MPSMatrix* resultMatrix = [[MPSMatrix alloc] initWithBuffer:resultBuf descriptor:desc];
+
+        uint32_t n32 = (uint32_t)n;
+        uint32_t lStride = (uint32_t)(mpsRowBytes / elem_size);
+
+        for (int64_t b = 0; b < batchSize; b++) {
+            size_t srcOffset = (size_t)b * matrixDataSize;
+            id<MTLBlitCommandEncoder> blitIn = [cmdBuf blitCommandEncoder];
+            [blitIn copyFromBuffer:inputs[0]
+                      sourceOffset:srcOffset
+                          toBuffer:srcSlice
+                 destinationOffset:0
+                              size:matrixDataSize];
+            [blitIn endEncoding];
+
+            if (needsPadding) {
+                memset(srcBuf.contents, 0, matrixMpsSize);
+                PadToBuffer(cmdBuf, srcSlice, srcBuf, n, dataRowBytes, mpsRowBytes);
+            }
+
+            FillBufferWithZeros(cmdBuf, resultBuf, matrixMpsSize);
+
+            [cholesky encodeToCommandBuffer:cmdBuf
+                               sourceMatrix:sourceMatrix
+                               resultMatrix:resultMatrix
+                                     status:nil];
+
+            if (verifyPipeline) {
+                id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+                [enc setComputePipelineState:verifyPipeline];
+                [enc setBuffer:resultBuf offset:0 atIndex:0];
+                [enc setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [enc setBytes:&lStride length:sizeof(lStride) atIndex:2];
+                [enc dispatchThreads:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                [enc endEncoding];
+            }
+
+            if (needsPadding) {
+                UnpadToBuffer(cmdBuf, resultBuf, unpaddedBuf, n, dataRowBytes, mpsRowBytes);
+            }
+
+            size_t dstOffset = (size_t)b * matrixDataSize;
+            id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+            [blit copyFromBuffer:unpaddedBuf
+                     sourceOffset:0
+                         toBuffer:outBuf
+                destinationOffset:dstOffset
+                             size:matrixDataSize];
+            [blit endEncoding];
+        }
     }
 
     return NativeResult::Buffer(outBuf);
@@ -272,7 +401,8 @@ REGISTER_NATIVE_MPS_OP("stablehlo.cholesky", NativeHandle_cholesky);
 
 // Metal compute shader for complex triangular solve.
 // Uses float2 to represent complex numbers (real, imag).
-// Each thread handles one column of the RHS.
+// Left-side (op(A)*X=B): each thread handles one RHS column.
+// Right-side (X*op(A)=B): each thread handles one row.
 static id<MTLComputePipelineState> GetComplexTriSolvePipeline(id<MTLDevice> device) {
     static id<MTLComputePipelineState> pipeline = nil;
     static dispatch_once_t onceToken;
@@ -293,53 +423,82 @@ static id<MTLComputePipelineState> GetComplexTriSolvePipeline(id<MTLDevice> devi
            "                  (a.y*b.x - a.x*b.y) / d);\n"
            "}\n"
            "\n"
+           "// Get element of op(A) at (row, col) given flags.\n"
+           "static inline float2 get_a(device const float2 *A, uint row, uint col, uint n,\n"
+           "                           bool do_trans, bool do_adjoint) {\n"
+           "    float2 a = (do_trans || do_adjoint) ? A[col * n + row] : A[row * n + col];\n"
+           "    if (do_adjoint) a.y = -a.y;\n"
+           "    return a;\n"
+           "}\n"
+           "\n"
            "kernel void complex_tri_solve(\n"
            "    device const float2 *A [[buffer(0)]],\n"
            "    device const float2 *B [[buffer(1)]],\n"
            "    device float2 *X [[buffer(2)]],\n"
            "    constant uint &n [[buffer(3)]],\n"
-           "    constant uint &nrhs [[buffer(4)]],\n"
-           "    constant uint &flags [[buffer(5)]],\n"
+           "    constant uint &nrows [[buffer(4)]],\n"
+           "    constant uint &ncols [[buffer(5)]],\n"
+           "    constant uint &flags [[buffer(6)]],\n"
            "    uint tid [[thread_position_in_grid]]\n"
            ") {\n"
-           "    if (tid >= nrhs) return;\n"
-           "    uint k = tid;\n"
+           "    bool lower = (flags & 1U) != 0;\n"
+           "    bool unit_diag = (flags & 2U) != 0;\n"
+           "    bool do_trans = (flags & 4U) != 0;\n"
+           "    bool do_adjoint = (flags & 8U) != 0;\n"
+           "    bool right_side = (flags & 16U) != 0;\n"
            "\n"
-           "    bool lower = (flags & 1u) != 0;\n"
-           "    bool unit_diag = (flags & 2u) != 0;\n"
-           "    bool do_trans = (flags & 4u) != 0;\n"
-           "    bool do_adjoint = (flags & 8u) != 0;\n"
+           "    // Effective triangularity of op(A).\n"
+           "    bool eff_lower = lower != (do_trans || do_adjoint);\n"
            "\n"
-           "    // Copy B column to X\n"
-           "    for (uint i = 0; i < n; i++) {\n"
-           "        X[i * nrhs + k] = B[i * nrhs + k];\n"
-           "    }\n"
+           "    if (right_side) {\n"
+           "        // X * op(A) = B: each thread handles one row.\n"
+           "        uint r = tid;\n"
+           "        if (r >= nrows) return;\n"
            "\n"
-           "    // Determine iteration direction:\n"
-           "    // lower + no trans/adj → forward\n"
-           "    // upper + no trans/adj → backward\n"
-           "    // lower + trans/adj → backward\n"
-           "    // upper + trans/adj → forward\n"
-           "    bool forward = lower != (do_trans || do_adjoint);\n"
+           "        for (uint k = 0; k < ncols; k++)\n"
+           "            X[r * ncols + k] = B[r * ncols + k];\n"
            "\n"
-           "    for (uint step = 0; step < n; step++) {\n"
-           "        uint i = forward ? step : (n - 1 - step);\n"
-           "        float2 sum = X[i * nrhs + k];\n"
-           "\n"
-           "        for (uint prev = 0; prev < step; prev++) {\n"
-           "            uint j = forward ? prev : (n - 1 - prev);\n"
-           "            float2 a = (do_trans || do_adjoint) ? A[j * n + i] : A[i * n + j];\n"
-           "            if (do_adjoint) a.y = -a.y;\n"
-           "            sum -= cmul(a, X[j * nrhs + k]);\n"
+           "        // Forward when eff upper, backward when eff lower.\n"
+           "        bool forward = !eff_lower;\n"
+           "        for (uint step = 0; step < n; step++) {\n"
+           "            uint k = forward ? step : (n - 1 - step);\n"
+           "            float2 sum = X[r * ncols + k];\n"
+           "            for (uint prev = 0; prev < step; prev++) {\n"
+           "                uint j = forward ? prev : (n - 1 - prev);\n"
+           "                float2 a = get_a(A, j, k, n, do_trans, do_adjoint);\n"
+           "                sum -= cmul(X[r * ncols + j], a);\n"
+           "            }\n"
+           "            if (!unit_diag) {\n"
+           "                float2 diag = A[k * n + k];\n"
+           "                if (do_adjoint) diag.y = -diag.y;\n"
+           "                sum = cdiv(sum, diag);\n"
+           "            }\n"
+           "            X[r * ncols + k] = sum;\n"
            "        }\n"
+           "    } else {\n"
+           "        // op(A) * X = B: each thread handles one RHS column.\n"
+           "        uint k = tid;\n"
+           "        if (k >= ncols) return;\n"
            "\n"
-           "        if (!unit_diag) {\n"
-           "            float2 diag = A[i * n + i];\n"
-           "            if (do_adjoint) diag.y = -diag.y;\n"
-           "            sum = cdiv(sum, diag);\n"
+           "        for (uint i = 0; i < nrows; i++)\n"
+           "            X[i * ncols + k] = B[i * ncols + k];\n"
+           "\n"
+           "        bool forward = eff_lower;\n"
+           "        for (uint step = 0; step < n; step++) {\n"
+           "            uint i = forward ? step : (n - 1 - step);\n"
+           "            float2 sum = X[i * ncols + k];\n"
+           "            for (uint prev = 0; prev < step; prev++) {\n"
+           "                uint j = forward ? prev : (n - 1 - prev);\n"
+           "                float2 a = get_a(A, i, j, n, do_trans, do_adjoint);\n"
+           "                sum -= cmul(a, X[j * ncols + k]);\n"
+           "            }\n"
+           "            if (!unit_diag) {\n"
+           "                float2 diag = A[i * n + i];\n"
+           "                if (do_adjoint) diag.y = -diag.y;\n"
+           "                sum = cdiv(sum, diag);\n"
+           "            }\n"
+           "            X[i * ncols + k] = sum;\n"
            "        }\n"
-           "\n"
-           "        X[i * nrhs + k] = sum;\n"
            "    }\n"
            "}\n";
       NSError* error = nil;
@@ -424,10 +583,6 @@ static NativeResult NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLCo
         return NativeResult::Error("triangular_solve: only float32 and complex64 are supported");
     }
 
-    if (isComplex && !leftSide) {
-        return NativeResult::Error("triangular_solve: right-side complex solve not yet supported");
-    }
-
     int pjrt_dtype = MlirTypeToPjrtDtype(elemType);
     size_t elem_size = DtypeByteSize(pjrt_dtype);
     size_t aMatrixDataSize = (size_t)(n * n) * elem_size;
@@ -444,11 +599,12 @@ static NativeResult NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLCo
             return NativeResult::Error("triangular_solve: complex shader compilation failed");
         }
 
-        // Flags: bit 0 = lower, bit 1 = unit_diag, bit 2 = transpose, bit 3 = adjoint
+        // Flags: bit 0=lower, 1=unit_diag, 2=transpose, 3=adjoint, 4=right_side
         uint32_t flags = (lower ? 1U : 0U) | (unitDiagonal ? 2U : 0U) | (isTranspose ? 4U : 0U) |
-                         (isAdjoint ? 8U : 0U);
+                         (isAdjoint ? 8U : 0U) | (leftSide ? 0U : 16U);
         uint32_t n32 = (uint32_t)n;
-        uint32_t nrhs32 = (uint32_t)bCols;
+        uint32_t nrows32 = (uint32_t)bRows;
+        uint32_t ncols32 = (uint32_t)bCols;
 
         // Per-batch buffers for the shader (A slice, B slice, X output slice).
         id<MTLBuffer> aSlice = [device newBufferWithLength:aMatrixDataSize
@@ -477,17 +633,21 @@ static NativeResult NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLCo
             [blit endEncoding];
 
             // Dispatch the complex triangular solve shader.
+            // Left-side: parallelize across columns (ncols threads).
+            // Right-side: parallelize across rows (nrows threads).
+            uint32_t gridSize = leftSide ? ncols32 : nrows32;
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:aSlice offset:0 atIndex:0];
             [enc setBuffer:bSlice offset:0 atIndex:1];
             [enc setBuffer:xSlice offset:0 atIndex:2];
             [enc setBytes:&n32 length:sizeof(n32) atIndex:3];
-            [enc setBytes:&nrhs32 length:sizeof(nrhs32) atIndex:4];
-            [enc setBytes:&flags length:sizeof(flags) atIndex:5];
-            [enc dispatchThreads:MTLSizeMake(nrhs32, 1, 1)
+            [enc setBytes:&nrows32 length:sizeof(nrows32) atIndex:4];
+            [enc setBytes:&ncols32 length:sizeof(ncols32) atIndex:5];
+            [enc setBytes:&flags length:sizeof(flags) atIndex:6];
+            [enc dispatchThreads:MTLSizeMake(gridSize, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(
-                                          MIN(nrhs32,
+                                          MIN(gridSize,
                                               (uint32_t)pipeline.maxTotalThreadsPerThreadgroup),
                                           1, 1)];
             [enc endEncoding];

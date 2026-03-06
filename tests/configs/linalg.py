@@ -16,6 +16,18 @@ def _random_posdef(key, n: int, batch_shape: tuple[int, ...] = ()):
     return result
 
 
+def _random_complex_posdef(key, n: int, batch_shape: tuple[int, ...] = ()):
+    """Generate random Hermitian positive-definite matrices (complex64)."""
+    shape = (*batch_shape, n, n)
+    k1, k2 = random.split(key)
+    A = random.normal(k1, shape) + 1j * random.normal(k2, shape)
+    # A @ A^H + n*I to ensure Hermitian positive-definite
+    result = jnp.einsum("...ij,...kj->...ik", A, jnp.conj(A)) + n * jnp.eye(
+        n, dtype=jnp.complex64
+    )
+    return result
+
+
 def _solve_triangular_lower(L, B):
     return solve_triangular(L, B, lower=True)
 
@@ -114,6 +126,47 @@ def make_linalg_op_configs():
             numpy.array([[-1, 0], [0, 1]], dtype=numpy.float32),
             name="cholesky_non_posdef",
         )
+
+        # --- Complex Cholesky ---
+        for n in [2, 3, 4]:
+            yield OperationTestConfig(
+                jnp.linalg.cholesky,
+                lambda key, n=n: _random_complex_posdef(key, n),
+                name=f"cholesky_complex_{n}x{n}",
+            )
+
+        # Complex non-positive-definite (should produce NaN like CPU).
+        yield OperationTestConfig(
+            jnp.linalg.cholesky,
+            numpy.array([[-1 + 0j, 0], [0, 1 + 0j]], dtype=numpy.complex64),
+            name="cholesky_complex_non_posdef",
+        )
+
+        # Complex with purely real data (0 imaginary) — should match float32 results.
+        for n in [2, 3, 4]:
+            yield OperationTestConfig(
+                jnp.linalg.cholesky,
+                lambda key, n=n: _random_posdef(key, n).astype(jnp.complex64),
+                name=f"cholesky_complex_real_only_{n}x{n}",
+            )
+
+        # Complex 1x1
+        yield OperationTestConfig(
+            jnp.linalg.cholesky,
+            numpy.array([[4.0 + 0j]], dtype=numpy.complex64),
+            name="cholesky_complex_1x1",
+        )
+
+        # Complex batched
+        for batch_shape in [(2,), (2, 3)]:
+            batch_str = "x".join(map(str, batch_shape))
+            yield OperationTestConfig(
+                jnp.linalg.cholesky,
+                lambda key, bs=batch_shape: _random_complex_posdef(
+                    key, 3, batch_shape=bs
+                ),
+                name=f"cholesky_complex_batched_{batch_str}",
+            )
 
         for n in [2, 3, 4]:
             # Lower triangular, single RHS column.
